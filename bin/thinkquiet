@@ -1,0 +1,918 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""thinkquiet - gestione profili energetici per ThinkPad.
+
+Profili:
+  risparmio   turbo off, cap ~1.2 GHz, EPP power,          ventola auto
+  intermedio  turbo on,  cap ~2.7 GHz, EPP balance_power,  ventola auto
+  potente     turbo on,  cap 3.6 GHz,  EPP performance,     ventola auto
+  sera        turbo off, cap ~0.9 GHz, EPP power,           ventola spenta
+              (con watchdog termico che la riaccende se serve)
+
+`apply` e `stop` richiedono root (la GUI usa sudo -n).
+`status` e `doctor` sono leggibili anche da utente normale.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Percorsi (THINKQUIET_ROOT permette di testare su un albero finto)
+# ---------------------------------------------------------------------------
+
+ROOT = Path(os.environ.get("THINKQUIET_ROOT", "/"))
+STATE_DIR = Path(os.environ.get("THINKQUIET_STATE_DIR", "/run/thinkquiet"))
+LAST_DIR = Path(os.environ.get("THINKQUIET_LAST_DIR", "/var/lib/thinkquiet"))
+
+PROFILE_FILE = STATE_DIR / "profile"
+PID_FILE = STATE_DIR / "daemon.pid"
+LOCK_FILE = STATE_DIR / "daemon.lock"
+LAST_FILE = LAST_DIR / "last-profile"
+TUNING_DIR = LAST_DIR / "user"
+TUNING_FILE = Path(
+    os.environ.get("THINKQUIET_TUNING_FILE", str(TUNING_DIR / "tuning.json"))
+)
+
+SERVICE = "thinkquiet-daemon.service"
+
+# ---------------------------------------------------------------------------
+# Profili
+# ---------------------------------------------------------------------------
+
+ORDER = ["risparmio", "intermedio", "potente", "sera"]
+
+# Sera ha due varianti: batteria (silenzio assoluto) e alimentatore
+# (piu' prestazioni mantenendo la ventola al minimo).
+SERA_BATTERY = {
+    "ppd": "power-saver",
+    "epp": "power",
+    "turbo": False,
+    "max_perf_pct": 25,   # ~0,9 GHz
+    "max_khz": 900000,
+    "fan": "off",
+}
+SERA_AC = {
+    "ppd": "balanced",
+    "epp": "balance_power",
+    "turbo": True,
+    "max_perf_pct": 56,   # ~2,0 GHz
+    "max_khz": 2000000,
+    "fan": "quiet",
+}
+
+PROFILES = {
+    "risparmio": {
+        "label": "Risparmio",
+        "desc": "Turbo off · max 1,2 GHz · ventola auto",
+        "color": "#2e7d32",
+        "ppd": "power-saver",
+        "epp": "power",
+        "turbo": False,
+        "max_perf_pct": 33,   # ~1,2 GHz su 3,6 GHz
+        "max_khz": 1200000,   # fallback senza intel_pstate
+        "fan": "auto",
+    },
+    "intermedio": {
+        "label": "Intermedio",
+        "desc": "Turbo on · max 2,7 GHz · ventola auto",
+        "color": "#1565c0",
+        "ppd": "balanced",
+        "epp": "balance_power",
+        "turbo": True,
+        "max_perf_pct": 75,   # ~2,7 GHz
+        "max_khz": 2700000,
+        "fan": "auto",
+    },
+    "potente": {
+        "label": "Potente",
+        "desc": "Turbo on · max 3,6 GHz · ventola auto",
+        "color": "#c62828",
+        "ppd": "performance",
+        "epp": "performance",
+        "turbo": True,
+        "max_perf_pct": 100,
+        "max_khz": 3600000,
+        "fan": "auto",
+    },
+    "sera": {
+        "label": "Sera",
+        "desc": "AC/batteria adattivo · ventola silenziosa",
+        "color": "#6a1b9a",
+        **SERA_BATTERY,
+        "ac": SERA_AC,
+    },
+}
+
+# Profilo usato da `stop` per ripristinare un assetto neutro.
+RESTORE = {
+    "epp": "balance_performance",
+    "turbo": True,
+    "max_perf_pct": 100,
+    "max_khz": 3600000,
+}
+
+# Isteresi del watchdog ventola a batteria (Sera, ventola spenta).
+FAN_TEMP_LOW = 52.0       # sotto questa soglia: ventola spenta
+FAN_TEMP_MID = 62.0       # sopra: livello 1
+FAN_TEMP_HIGH = 70.0      # sopra: livello 3
+FAN_TEMP_AUTO = 78.0      # sopra: ventola automatica (EC)
+
+# Isteresi del watchdog ventola con alimentatore (Sera, livello 1).
+QUIET_TEMP_LOW = 56.0     # sotto: livello 1
+QUIET_TEMP_2 = 68.0       # sopra: livello 2
+QUIET_TEMP_3 = 74.0       # sopra: livello 3
+QUIET_TEMP_AUTO = 80.0    # sopra: ventola automatica (EC)
+
+# Fine tuning di Sera, modificabile dalla GUI (file scrivibile dall'utente).
+TUNING_DEFAULTS = {
+    "sera_ac_max_mhz": 2000,
+    "sera_ac_fan_base": 0,
+    "sera_ac_temp_mid": 68,
+    "sera_bat_max_mhz": 900,
+    "sera_bat_temp_mid": 62,
+}
+TUNING_RANGES = {
+    "sera_ac_max_mhz": (1200, 2700),
+    "sera_ac_fan_base": (0, 3),
+    "sera_ac_temp_mid": (60, 78),
+    "sera_bat_max_mhz": (600, 1700),
+    "sera_bat_temp_mid": (55, 75),
+}
+
+
+def load_tuning() -> dict:
+    """Legge il tuning utente, con clamp ai limiti sicuri."""
+    tuning = dict(TUNING_DEFAULTS)
+    raw = _read(TUNING_FILE)
+    if not raw:
+        return tuning
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return tuning
+    if not isinstance(data, dict):
+        return tuning
+    for key, (low, high) in TUNING_RANGES.items():
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        tuning[key] = max(low, min(high, int(value)))
+    return tuning
+
+
+def effective_profile(key: str, ac: bool, tuning: dict | None = None) -> dict:
+    """Restituisce il profilo effettivo, con variante AC e fine tuning."""
+    prof = dict(PROFILES[key])
+    if key != "sera":
+        return prof
+
+    tune = tuning if tuning is not None else load_tuning()
+    if ac:
+        prof.update(prof.get("ac", {}))
+        max_mhz = tune["sera_ac_max_mhz"]
+        prof["max_khz"] = max_mhz * 1000
+        prof["max_perf_pct"] = max(1, min(100, round(max_mhz * 100 / 3600)))
+        prof["fan_base"] = tune["sera_ac_fan_base"]
+        prof["fan_mid"] = tune["sera_ac_temp_mid"]
+        prof["fan_high"] = min(tune["sera_ac_temp_mid"] + 6, 80)
+        prof["fan_auto"] = min(tune["sera_ac_temp_mid"] + 12, 84)
+        prof["fan_low"] = max(40, tune["sera_ac_temp_mid"] - 10)
+    else:
+        max_mhz = tune["sera_bat_max_mhz"]
+        prof["max_khz"] = max_mhz * 1000
+        prof["max_perf_pct"] = max(1, min(100, round(max_mhz * 100 / 3600)))
+        prof["fan_base"] = 0
+        prof["fan_mid"] = tune["sera_bat_temp_mid"]
+        prof["fan_high"] = min(tune["sera_bat_temp_mid"] + 8, 80)
+        prof["fan_auto"] = min(tune["sera_bat_temp_mid"] + 16, 82)
+        prof["fan_low"] = max(40, tune["sera_bat_temp_mid"] - 10)
+    return prof
+
+
+def effective_label(key: str, ac: bool) -> str:
+    label = PROFILES[key]["label"]
+    if key == "sera":
+        label += " · AC" if ac else " · batteria"
+    return label
+
+_WARNED: set[str] = set()
+
+
+def _warn_once(msg: str) -> None:
+    if msg not in _WARNED:
+        _WARNED.add(msg)
+        print(msg, file=sys.stderr, flush=True)
+
+
+def rp(rel: str) -> Path:
+    """Path assoluto nel (finto) filesystem radice."""
+    return ROOT / rel.lstrip("/")
+
+
+# ---------------------------------------------------------------------------
+# I/O di base
+# ---------------------------------------------------------------------------
+
+def _read(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except (OSError, UnicodeError):
+        return None
+
+
+def _read_int(path: Path) -> int | None:
+    value = _read(path)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _write(path: Path, value: str, dry: bool = False) -> bool:
+    if dry:
+        print(f"[dry-run] {path} <- {value!r}")
+        return True
+    try:
+        path.write_text(value + "\n")
+        return True
+    except OSError as exc:
+        _warn_once(f"thinkquiet: impossibile scrivere {path}: {exc}")
+        return False
+
+
+def _write_if_changed(path: Path, value: str, dry: bool = False) -> bool:
+    if _read(path) == value:
+        return True
+    return _write(path, value, dry)
+
+
+def _atomic_write(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(value)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# CPU: EPP, turbo, limite frequenza
+# ---------------------------------------------------------------------------
+
+def _policies() -> list[Path]:
+    return [Path(p) for p in sorted(glob.glob(str(rp("sys/devices/system/cpu/cpufreq/policy*"))))]
+
+
+def apply_core(prof: dict, dry: bool = False) -> list[str]:
+    """Applica EPP, turbo e cap di frequenza. Ritorna la lista di errori."""
+    errors: list[str] = []
+
+    no_turbo = rp("sys/devices/system/cpu/intel_pstate/no_turbo")
+    max_pct = rp("sys/devices/system/cpu/intel_pstate/max_perf_pct")
+
+    # Prima il turbo, poi il cap: cambiare no_turbo puo' far ricalcolare i
+    # limiti al driver, quindi il cap viene scritto dopo.
+    if no_turbo.exists():
+        if not _write_if_changed(no_turbo, "0" if prof["turbo"] else "1", dry):
+            errors.append(f"no_turbo ({no_turbo})")
+
+    # Il cap in kHz e' esplicito e non ambiguo anche con turbo disattivato.
+    # Lo scriviamo su ogni policy; se il driver arrotonda al P-state vicino
+    # (passi da 100 MHz) evitiamo riscritture inutili.
+    wrote_freq = False
+    for pol in _policies():
+        freq_file = pol / "scaling_max_freq"
+        if not freq_file.exists():
+            continue
+        wrote_freq = True
+        current = _read_int(freq_file)
+        if current is not None and abs(current - prof["max_khz"]) <= 200000:
+            continue
+        if not _write(freq_file, str(prof["max_khz"]), dry):
+            errors.append(f"scaling_max_freq ({freq_file})")
+
+    # Fallback per driver che non espongono scaling_max_freq.
+    if not wrote_freq and max_pct.exists():
+        if not _write_if_changed(max_pct, str(prof["max_perf_pct"]), dry):
+            errors.append(f"max_perf_pct ({max_pct})")
+
+    for pol in _policies():
+        epp = pol / "energy_performance_preference"
+        if epp.exists() and not _write_if_changed(epp, prof["epp"], dry):
+            errors.append(f"EPP ({epp})")
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Ventola (thinkpad_acpi)
+# ---------------------------------------------------------------------------
+
+def fan_control_enabled() -> bool:
+    value = _read(rp("sys/module/thinkpad_acpi/parameters/fan_control"))
+    return value is not None and value.upper() in ("Y", "1")
+
+
+def fan_available() -> bool:
+    return fan_control_enabled() and rp("proc/acpi/ibm/fan").exists()
+
+
+def set_fan(value: str | int, dry: bool = False) -> bool:
+    if not fan_available():
+        return False
+    return _write(rp("proc/acpi/ibm/fan"), f"level {value}", dry)
+
+
+def fan_status() -> dict:
+    text = _read(rp("proc/acpi/ibm/fan")) or ""
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if ":" in line:
+            key, val = line.split(":", 1)
+            fields[key.strip()] = val.strip()
+    rpm: int | None = None
+    try:
+        rpm = int(fields.get("speed", ""))
+    except ValueError:
+        pass
+    return {
+        "available": fan_available(),
+        "control": fan_control_enabled(),
+        "status": fields.get("status"),
+        "rpm": rpm,
+        "level": fields.get("level"),
+    }
+
+
+def fan_target(
+    policy: str, temp: float | None, previous: str | int, prof: dict | None = None
+) -> str | int:
+    """Sceglie il livello ventola con isteresi.
+
+    policy:
+      auto  -> gestione automatica dell'EC
+      off   -> ventola spenta (Sera a batteria)
+      quiet -> livello base (Sera con alimentatore)
+    """
+    if policy == "auto":
+        return "auto"
+    if temp is None:
+        return "auto"  # senza sensore, meglio non rischiare
+
+    p = prof or {}
+    default_base = 0 if policy == "off" else 1
+    default_mid = FAN_TEMP_MID if policy == "off" else QUIET_TEMP_2
+    default_high = FAN_TEMP_HIGH if policy == "off" else QUIET_TEMP_3
+    default_auto = FAN_TEMP_AUTO if policy == "off" else QUIET_TEMP_AUTO
+
+    base = int(p.get("fan_base", default_base))
+    mid = float(p.get("fan_mid", default_mid))
+    high = float(p.get("fan_high", default_high))
+    auto = float(p.get("fan_auto", default_auto))
+    low = float(p.get("fan_low", max(40.0, mid - 10.0)))
+
+    if temp >= auto:
+        return "auto"
+    if temp >= high:
+        return 3
+    if temp >= mid:
+        return min(base + 1, 3)
+    if temp <= low:
+        return base
+    if previous in (None, "auto"):
+        return base
+    return previous
+
+
+# ---------------------------------------------------------------------------
+# Sensori
+# ---------------------------------------------------------------------------
+
+def cpu_temp_c() -> float | None:
+    # 1) zona termica x86_pkg_temp
+    for zone in sorted(glob.glob(str(rp("sys/class/thermal/thermal_zone*")))):
+        z = Path(zone)
+        if _read(z / "type") == "x86_pkg_temp":
+            raw = _read_int(z / "temp")
+            if raw is not None:
+                return raw / 1000.0
+    # 2) hwmon coretemp
+    for hw in sorted(glob.glob(str(rp("sys/class/hwmon/hwmon*")))):
+        h = Path(hw)
+        if _read(h / "name") == "coretemp":
+            vals = [
+                v
+                for v in (_read_int(Path(f)) for f in glob.glob(str(h / "temp*_input")))
+                if v is not None
+            ]
+            if vals:
+                return max(vals) / 1000.0
+    # 3) sensore CPU del ThinkPad
+    for hw in sorted(glob.glob(str(rp("sys/class/hwmon/hwmon*")))):
+        h = Path(hw)
+        if _read(h / "name") == "thinkpad":
+            raw = _read_int(h / "temp1_input")
+            if raw is not None:
+                return raw / 1000.0
+    return None
+
+
+def cur_freq_mhz() -> int | None:
+    vals = [
+        v
+        for v in (
+            _read_int(Path(f))
+            for f in glob.glob(str(rp("sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq")))
+        )
+        if v
+    ]
+    return round(max(vals) / 1000) if vals else None
+
+
+def battery_status() -> dict:
+    base = rp("sys/class/power_supply/BAT0")
+    ac = False
+    for ps in glob.glob(str(rp("sys/class/power_supply/*"))):
+        p = Path(ps)
+        if _read(p / "type") == "Mains" and _read(p / "online") == "1":
+            ac = True
+            break
+    return {
+        "percent": _read_int(base / "capacity"),
+        "status": _read(base / "status"),
+        "ac": ac,
+    }
+
+
+# ---------------------------------------------------------------------------
+# power-profiles-daemon
+# ---------------------------------------------------------------------------
+
+def ppd_active() -> str | None:
+    try:
+        proc = subprocess.run(
+            ["powerprofilesctl", "get"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def set_ppd(name: str) -> bool:
+    if os.environ.get("THINKQUIET_NO_PPD"):
+        return False
+    if ppd_active() == name:
+        return True
+    try:
+        proc = subprocess.run(
+            ["powerprofilesctl", "set", name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Stato
+# ---------------------------------------------------------------------------
+
+def daemon_pid() -> int | None:
+    pid = _read_int(PID_FILE)
+    if pid and Path(f"/proc/{pid}").exists():
+        return pid
+    return None
+
+
+def profiles_public() -> list[dict]:
+    return [
+        {
+            "key": key,
+            "label": PROFILES[key]["label"],
+            "desc": PROFILES[key]["desc"],
+            "color": PROFILES[key]["color"],
+        }
+        for key in ORDER
+    ]
+
+
+def collect_status() -> dict:
+    key = _read(PROFILE_FILE)
+    if key not in PROFILES:
+        key = None
+
+    fan = fan_status()
+    warnings: list[str] = []
+    if key == "sera" and not fan["available"]:
+        warnings.append(
+            "Controllo ventola non attivo: riavvia il PC dopo l'installazione."
+        )
+    if key == "sera" and daemon_pid() is None:
+        warnings.append(
+            "Watchdog non attivo: la ventola resta in auto per sicurezza."
+        )
+
+    pol0 = rp("sys/devices/system/cpu/cpufreq/policy0")
+    no_turbo = _read(rp("sys/devices/system/cpu/intel_pstate/no_turbo"))
+    max_freq_khz = _read_int(pol0 / "scaling_max_freq")
+    battery = battery_status()
+    ac = bool(battery["ac"])
+    return {
+        "profile": key,
+        "label": effective_label(key, ac) if key else "Automatico",
+        "profiles": profiles_public(),
+        "epp": _read(pol0 / "energy_performance_preference"),
+        "turbo": (no_turbo == "0") if no_turbo is not None else None,
+        "max_freq_mhz": round(max_freq_khz / 1000) if max_freq_khz else None,
+        "max_perf_pct": _read_int(rp("sys/devices/system/cpu/intel_pstate/max_perf_pct")),
+        "freq_mhz": cur_freq_mhz(),
+        "temp_c": cpu_temp_c(),
+        "fan": fan,
+        "battery": battery,
+        "ac": ac,
+        "ppd": ppd_active(),
+        "tuning": load_tuning(),
+        "daemon": daemon_pid() is not None,
+        "daemon_pid": daemon_pid(),
+        "warnings": warnings,
+        "timestamp": int(time.time()),
+    }
+
+
+def _fmt_temp(value: float | None) -> str:
+    return f"{value:.0f} °C" if value is not None else "—"
+
+
+def print_status(st: dict) -> None:
+    fan = st["fan"]
+    if fan["rpm"] is not None:
+        fan_txt = f"{fan['rpm']} RPM (livello {fan['level']})"
+    else:
+        fan_txt = "—"
+    control = "attivo" if fan["available"] else "NON attivo"
+    turbo = "on" if st["turbo"] else "off" if st["turbo"] is not None else "?"
+    batt = st["battery"]
+    batt_txt = (
+        f"{batt['percent']}% · {batt['status']} · {'AC' if batt['ac'] else 'batteria'}"
+        if batt["percent"] is not None
+        else "—"
+    )
+    print(f"Profilo:   {st['label']}" + (f" ({st['profile']})" if st["profile"] else ""))
+    cap = (
+        f"{st['max_freq_mhz']} MHz"
+        if st.get("max_freq_mhz")
+        else f"{st['max_perf_pct'] or '?'}%"
+    )
+    print(
+        f"CPU:       {_fmt_temp(st['temp_c'])} · {st['freq_mhz'] or '—'} MHz · "
+        f"EPP {st['epp'] or '?'} · turbo {turbo} · cap {cap}"
+    )
+    print(f"Ventola:   {fan_txt} · controllo {control}")
+    print(f"Batteria:  {batt_txt}")
+    print(f"PPD:       {st['ppd'] or '—'}")
+    print(f"Daemon:    {'attivo (pid ' + str(st['daemon_pid']) + ')' if st['daemon'] else 'fermo'}")
+    for warning in st["warnings"]:
+        print(f"Attenzione: {warning}")
+
+
+# ---------------------------------------------------------------------------
+# Comandi
+# ---------------------------------------------------------------------------
+
+def ensure_daemon() -> bool:
+    if os.environ.get("THINKQUIET_NO_SYSTEMD"):
+        return False
+    if not Path("/run/systemd/system").exists():
+        return False
+    try:
+        proc = subprocess.run(
+            ["systemctl", "start", SERVICE],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    key = args.profile
+    if key not in PROFILES:
+        print(f"thinkquiet: profilo sconosciuto: {key}", file=sys.stderr)
+        return 2
+
+    ac = bool(battery_status()["ac"])
+    prof = effective_profile(key, ac)
+    label = effective_label(key, ac)
+
+    if args.dry_run:
+        print(f"[dry-run] profilo {key} ({label}): {prof['label']}")
+        errors = apply_core(prof, dry=True)
+        if prof["fan"] == "auto":
+            set_fan("auto", dry=True)
+        else:
+            target = fan_target(prof["fan"], cpu_temp_c(), "auto", prof)
+            print(f"[dry-run] ventola <- livello {target}")
+        return 1 if errors else 0
+
+    if os.geteuid() != 0:
+        print("thinkquiet: 'apply' richiede root (usa sudo).", file=sys.stderr)
+        return 1
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LAST_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(PROFILE_FILE, key + "\n")
+    _atomic_write(LAST_FILE, key + "\n")
+
+    set_ppd(prof["ppd"])
+    time.sleep(0.15)  # lascia a PPD il tempo di applicare il suo profilo
+    errors = apply_core(prof)
+
+    started = ensure_daemon()
+    watchdog_ok = started or daemon_pid() is not None
+    if prof["fan"] == "auto":
+        set_fan("auto")
+    elif watchdog_ok and fan_available():
+        set_fan(fan_target(prof["fan"], cpu_temp_c(), "auto", prof))
+    else:
+        # Senza watchdog non lasciamo mai la ventola in manuale.
+        set_fan("auto")
+        if not watchdog_ok:
+            errors.append(
+                "watchdog non attivo: ventola riportata in auto per sicurezza"
+            )
+
+    status = collect_status()
+    status["applied"] = key
+    status["daemon_started"] = started
+    status["errors"] = errors
+    print(json.dumps(status, ensure_ascii=False))
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    if os.geteuid() != 0:
+        print("thinkquiet: 'stop' richiede root (usa sudo).", file=sys.stderr)
+        return 1
+
+    try:
+        PROFILE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+    if not os.environ.get("THINKQUIET_NO_SYSTEMD") and Path("/run/systemd/system").exists():
+        subprocess.run(
+            ["systemctl", "stop", SERVICE],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    else:
+        pid = daemon_pid()
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+    set_fan("auto")
+    set_ppd("balanced")
+    apply_core(RESTORE)
+    LAST_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(LAST_FILE, "intermedio\n")
+    print("thinkquiet: ripristinato automatico (balanced, ventola auto).")
+    return 0
+
+
+def cmd_fan_auto(args: argparse.Namespace) -> int:
+    """Sicurezza: rimette la ventola in auto (usato da ExecStopPost)."""
+    if os.geteuid() != 0:
+        print("thinkquiet: 'fan-auto' richiede root.", file=sys.stderr)
+        return 1
+    if fan_available() and not set_fan("auto"):
+        print("thinkquiet: impossibile impostare la ventola in auto.", file=sys.stderr)
+        return 1
+    print("thinkquiet: ventola in auto.")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    st = collect_status()
+    if args.json:
+        print(json.dumps(st, ensure_ascii=False))
+    else:
+        print_status(st)
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    checks = {
+        "python": sys.version.split()[0],
+        "helper": str(Path(__file__).resolve()),
+        "intel_pstate": rp("sys/devices/system/cpu/intel_pstate/status").exists(),
+        "epp": rp("sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference").exists(),
+        "thinkpad_acpi": rp("sys/module/thinkpad_acpi").exists(),
+        "fan_control": fan_control_enabled(),
+        "fan_proc": rp("proc/acpi/ibm/fan").exists(),
+        "ppd": ppd_active(),
+        "systemd_unit": Path("/etc/systemd/system/thinkquiet-daemon.service").exists(),
+        "sudoers": sudo_rule_ok(),
+        "pyside6": _module_version("PySide6"),
+    }
+    if args.json:
+        print(json.dumps(checks, ensure_ascii=False))
+    else:
+        for key, value in checks.items():
+            print(f"{key:16} {value}")
+        if not checks["fan_control"]:
+            print()
+            print("Nota: fan_control non è attivo. Riavvia il PC dopo l'installazione")
+            print("      per abilitare il controllo della ventola (profilo Sera).")
+    return 0
+
+
+def sudo_rule_ok() -> bool:
+    """Verifica la regola NOPASSWD senza leggere /etc/sudoers.d (non leggibile)."""
+    if os.geteuid() == 0:
+        return True
+    helper = shutil.which("thinkquiet") or "/usr/local/bin/thinkquiet"
+    if not Path(helper).exists():
+        helper = str(Path(__file__).resolve())
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    output = " ".join((proc.stdout + proc.stderr).split())
+    return "NOPASSWD:" in output and helper in output
+
+
+def _module_version(name: str) -> str | None:
+    try:
+        mod = __import__(name)
+        return getattr(mod, "__version__", "presente")
+    except Exception:
+        return None
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    if os.geteuid() != 0:
+        print("thinkquiet: 'daemon' richiede root.", file=sys.stderr)
+        return 1
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("thinkquiet: daemon gia' in esecuzione.", file=sys.stderr)
+        return 0
+
+    PID_FILE.write_text(str(os.getpid()) + "\n")
+
+    stop_requested = False
+
+    def on_signal(_signum, _frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    # Legge il livello reale: se un'esecuzione precedente ha lasciato la ventola
+    # in manuale, il primo giro la riporta in auto (o la gestisce).
+    previous_fan: str | int = fan_status().get("level") or "auto"
+    last_ppd_check = 0.0
+    last_ac: bool | None = None
+    print("thinkquiet: daemon avviato.", flush=True)
+
+    try:
+        while not stop_requested:
+            key = _read(PROFILE_FILE)
+            if key not in PROFILES:
+                key = _read(LAST_FILE)
+                if key not in PROFILES:
+                    key = "intermedio"
+                _atomic_write(PROFILE_FILE, key + "\n")
+
+            ac = bool(battery_status()["ac"])
+            prof = effective_profile(key, ac)
+
+            if ac != last_ac:
+                last_ac = ac
+                previous_fan = "auto"
+                last_ppd_check = 0.0  # forza il sync di PPD
+                print(
+                    f"thinkquiet: alimentazione {'AC' if ac else 'batteria'}"
+                    f" -> {prof['ppd']}",
+                    flush=True,
+                )
+
+            apply_core(prof)
+
+            if prof["fan"] == "auto":
+                if previous_fan != "auto":
+                    if set_fan("auto"):
+                        print("thinkquiet: ventola -> auto", flush=True)
+                    previous_fan = "auto"
+            elif fan_available():
+                target = fan_target(prof["fan"], cpu_temp_c(), previous_fan, prof)
+                if str(target) != str(previous_fan):
+                    if set_fan(target):
+                        print(f"thinkquiet: ventola -> livello {target}", flush=True)
+                    previous_fan = target
+            elif previous_fan != "auto":
+                if set_fan("auto"):
+                    print("thinkquiet: ventola -> auto", flush=True)
+                previous_fan = "auto"
+
+            now = time.monotonic()
+            if now - last_ppd_check > 30:
+                last_ppd_check = now
+                if ppd_active() not in (None, prof["ppd"]):
+                    set_ppd(prof["ppd"])
+
+            # Sonno a piccoli passi per reagire subito a SIGTERM.
+            for _ in range(30):
+                if stop_requested:
+                    break
+                time.sleep(0.1)
+    finally:
+        # Qualunque cosa succeda, non lasciare mai la ventola in manuale.
+        set_fan("auto")
+        try:
+            PID_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        print("thinkquiet: daemon terminato, ventola in auto.", flush=True)
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="thinkquiet",
+        description="Profili energetici ThinkPad con controllo ventola.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_apply = sub.add_parser("apply", help="applica un profilo")
+    p_apply.add_argument("profile", choices=ORDER)
+    p_apply.add_argument("--dry-run", action="store_true", help="mostra senza scrivere")
+    p_apply.set_defaults(func=cmd_apply)
+
+    p_status = sub.add_parser("status", help="mostra lo stato")
+    p_status.add_argument("--json", action="store_true")
+    p_status.set_defaults(func=cmd_status)
+
+    p_stop = sub.add_parser("stop", help="ripristina automatico/balanced")
+    p_stop.set_defaults(func=cmd_stop)
+
+    p_fan = sub.add_parser("fan-auto", help="rimette la ventola in auto")
+    p_fan.set_defaults(func=cmd_fan_auto)
+
+    p_daemon = sub.add_parser("daemon", help="esegue il demone di controllo")
+    p_daemon.set_defaults(func=cmd_daemon)
+
+    p_doctor = sub.add_parser("doctor", help="diagnostica")
+    p_doctor.add_argument("--json", action="store_true")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

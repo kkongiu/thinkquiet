@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ThinkQuiet
+GenericName=Profili energetici
+Comment=Scegli rapidamente profilo energetico e gestione ventola
+Exec=@HOME@/.local/bin/thinkquiet-gui
+Icon=thinkquiet
+Terminal=false
+Categories=System;
+Keywords=energia;power;ventola;fan;thinkpad;risparmio;
+StartupNotify=false
+StartupWMClass=thinkquiet-gui

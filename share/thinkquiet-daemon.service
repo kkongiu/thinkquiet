@@ -1,0 +1,17 @@
+[Unit]
+Description=ThinkQuiet - profilo energetico e controllo ventola
+# Nessun After=/Wants= verso power-profiles-daemon: quel servizio e' ordinato
+# dopo multi-user.target e creerebbe un ciclo con la nostra unit.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/thinkquiet daemon
+# Anche in caso di crash/SIGKILL la ventola torna in auto.
+ExecStopPost=/usr/local/bin/thinkquiet fan-auto
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

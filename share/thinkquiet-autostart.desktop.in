@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ThinkQuiet
+Comment=Profili energetici e controllo ventola
+Exec=@HOME@/.local/bin/thinkquiet-gui --tray
+Icon=thinkquiet
+Terminal=false
+OnlyShowIn=KDE;
+X-KDE-autostart-after=panel
+X-KDE-autostart-phase=2
+StartupNotify=false

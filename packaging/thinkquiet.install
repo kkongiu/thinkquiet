@@ -1,0 +1,30 @@
+post_install() {
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        install -d -o "${SUDO_USER}" -g "$(id -gn "${SUDO_USER}")" -m 0755 \
+            /var/lib/thinkquiet/user
+        if [[ ! -f /var/lib/thinkquiet/user/tuning.json ]]; then
+            install -m 0644 -o "${SUDO_USER}" -g "$(id -gn "${SUDO_USER}")" \
+                /dev/null /var/lib/thinkquiet/user/tuning.json
+        fi
+    else
+        echo "Create /var/lib/thinkquiet/user owned by your desktop user,"
+        echo "otherwise the fine-tuning sliders cannot be saved."
+    fi
+
+    echo "ThinkQuiet installed."
+    echo "  Enable the daemon: sudo systemctl enable --now thinkquiet-daemon.service"
+    echo "  If fan_control is not Y: rebuild the initramfs and reboot."
+    echo "  The package grants the 'wheel' group the narrow ThinkQuiet sudo rule."
+}
+
+post_upgrade() {
+    post_install
+}
+
+pre_remove() {
+    systemctl disable --now thinkquiet-daemon.service >/dev/null 2>&1 || true
+}
+
+post_remove() {
+    echo "ThinkQuiet removed. Rebuild the initramfs if you removed fan_control."
+}

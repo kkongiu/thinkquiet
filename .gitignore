@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.tmp
+*.log
+*.tar.gz
+*.tar.zst
+.DS_Store
+.idea/
+.vscode/

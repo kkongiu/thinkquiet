@@ -1,0 +1,44 @@
+# Maintainer: kkongiu <kkongiu@users.noreply.github.com>
+pkgname=thinkquiet
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="AC-aware quiet power profiles for ThinkPad T580-class laptops"
+arch=('any')
+url="https://github.com/kkongiu/thinkquiet"
+license=('MIT')
+depends=('python' 'pyside6' 'power-profiles-daemon' 'sudo')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+install="$pkgname.install"
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+
+    install -Dm755 bin/thinkquiet "$pkgdir/usr/bin/thinkquiet"
+    install -Dm755 bin/thinkquiet-gui "$pkgdir/usr/bin/thinkquiet-gui"
+
+    install -d "$pkgdir/usr/lib/systemd/system"
+    sed 's|/usr/local/bin/thinkquiet|/usr/bin/thinkquiet|g' \
+        share/thinkquiet-daemon.service \
+        > "$pkgdir/usr/lib/systemd/system/thinkquiet-daemon.service"
+
+    install -Dm644 share/thinkquiet.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/thinkquiet.svg"
+
+    install -d "$pkgdir/usr/share/applications" "$pkgdir/etc/xdg/autostart"
+    sed 's|@HOME@/.local/bin/||g' share/thinkquiet-gui.desktop.in \
+        > "$pkgdir/usr/share/applications/thinkquiet-gui.desktop"
+    sed 's|@HOME@/.local/bin/||g' share/thinkquiet-autostart.desktop.in \
+        > "$pkgdir/etc/xdg/autostart/thinkquiet-gui.desktop"
+
+    install -Dm644 /dev/stdin "$pkgdir/etc/modprobe.d/thinkquiet.conf" <<'EOF'
+# ThinkQuiet: enable manual fan control (thinkpad_acpi)
+options thinkpad_acpi fan_control=1
+EOF
+
+    install -Dm440 /dev/stdin "$pkgdir/etc/sudoers.d/thinkquiet" <<'EOF'
+%wheel ALL=(root) NOPASSWD: /usr/bin/thinkquiet apply risparmio, /usr/bin/thinkquiet apply intermedio, /usr/bin/thinkquiet apply potente, /usr/bin/thinkquiet apply sera, /usr/bin/thinkquiet stop
+EOF
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
