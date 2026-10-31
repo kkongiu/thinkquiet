@@ -42,6 +42,8 @@ report if you test one.
     (default 68 °C), then a quiet watchdog ramp.
 - **Fine tuning**: five sliders for the Sera profile (CPU caps, fan base,
   temperature thresholds), applied live within a few seconds.
+- **Live CPU panel**: per-core usage, overall load, active cores and average
+  frequency.
 - **Thermal watchdog**: the fan is always ramped up automatically if the CPU
   gets hot, even when the GUI is closed.
 - **Crash-safe**: `ExecStopPost` puts the fan back in `auto` if the daemon is

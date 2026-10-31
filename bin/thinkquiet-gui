@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -15,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, QSize, Qt, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -193,6 +195,202 @@ class StatCard(QFrame):
             }}
             """
         )
+
+
+class CoreRow(QWidget):
+    def __init__(self, index: int, parent: QWidget | None = None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        name = QLabel(f"CPU{index}")
+        name.setMinimumWidth(34)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(10)
+        self.bar.setStyleSheet(
+            f"""
+            QProgressBar {{
+                border: 1px solid {rgba('#808080', 0.25)};
+                border-radius: 5px;
+                background: {rgba('#808080', 0.10)};
+            }}
+            QProgressBar::chunk {{
+                border-radius: 4px;
+                background: #1e88e5;
+            }}
+            """
+        )
+        self.value = QLabel("0%")
+        self.value.setMinimumWidth(34)
+        self.value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        layout.addWidget(name)
+        layout.addWidget(self.bar, 1)
+        layout.addWidget(self.value)
+
+    def set_usage(self, percent: float) -> None:
+        value = max(0, min(100, round(percent)))
+        self.bar.setValue(value)
+        self.value.setText(f"{value}%")
+
+
+class CpuMonitor(QObject):
+    """Legge /proc/stat e calcola l'uso per core tra due campionamenti."""
+
+    updated = Signal(dict)
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self._prev: dict[str, tuple[int, int]] = {}
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self.sample)
+
+    def start(self) -> None:
+        self.sample()
+        self._timer.start()
+
+    def sample(self) -> None:
+        try:
+            lines = Path("/proc/stat").read_text().splitlines()
+        except OSError:
+            return
+
+        cores: dict[int, float] = {}
+        overall = 0.0
+        new_prev: dict[str, tuple[int, int]] = {}
+
+        for line in lines:
+            if not line.startswith("cpu"):
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            name = parts[0]
+            try:
+                values = [int(value) for value in parts[1:]]
+            except ValueError:
+                continue
+
+            idle = values[3] + (values[4] if len(values) > 4 else 0)
+            total = sum(values)
+            old = self._prev.get(name)
+            percent = 0.0
+            if old is not None:
+                delta_total = total - old[0]
+                delta_idle = idle - old[1]
+                if delta_total > 0:
+                    percent = max(
+                        0.0, min(100.0, 100.0 * (delta_total - delta_idle) / delta_total)
+                    )
+            new_prev[name] = (total, idle)
+
+            if name == "cpu":
+                overall = percent
+                continue
+            try:
+                index = int(name[3:])
+            except ValueError:
+                continue
+            cores[index] = percent
+
+        self._prev = new_prev
+        if not cores:
+            return
+
+        try:
+            load1 = float(Path("/proc/loadavg").read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            load1 = 0.0
+
+        frequencies: list[int] = []
+        for filename in glob.glob(
+            "/sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq"
+        ):
+            try:
+                frequencies.append(int(Path(filename).read_text()))
+            except (OSError, ValueError):
+                pass
+
+        self.updated.emit(
+            {
+                "overall": overall,
+                "cores": cores,
+                "count": len(cores),
+                "active": sum(1 for value in cores.values() if value >= 5.0),
+                "load1": load1,
+                "freq_avg": sum(frequencies) / len(frequencies) if frequencies else 0,
+            }
+        )
+
+
+class CpuPanel(QFrame):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("cpuPanel")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 9, 12, 9)
+        outer.setSpacing(6)
+
+        header = QHBoxLayout()
+        header.setSpacing(14)
+        title = QLabel("CPU")
+        title.setObjectName("cpuTitle")
+        self.overall = QLabel("—")
+        self.overall.setObjectName("cpuOverall")
+        header.addWidget(title)
+        header.addWidget(self.overall)
+        header.addStretch(1)
+        self.load_label = QLabel("Load 1m —")
+        self.active_label = QLabel("Core attivi —")
+        self.freq_label = QLabel("Media —")
+        for label in (self.load_label, self.active_label, self.freq_label):
+            label.setObjectName("cpuDetail")
+            header.addWidget(label)
+        outer.addLayout(header)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(3)
+        self.bars: list[CoreRow] = []
+        count = os.cpu_count() or 8
+        for index in range(count):
+            row = CoreRow(index)
+            self.bars.append(row)
+            grid.addWidget(row, index // 4, index % 4)
+        outer.addLayout(grid)
+
+        self.setStyleSheet(
+            f"""
+            QFrame#cpuPanel {{
+                border: 1px solid {rgba('#808080', 0.25)};
+                border-radius: 12px;
+                background: {rgba('#808080', 0.04)};
+            }}
+            QLabel#cpuTitle {{ font-weight: 700; }}
+            QLabel#cpuOverall {{ font-weight: 700; color: #1565c0; }}
+            QLabel#cpuDetail {{ color: {rgba('#808080', 0.95)}; font-size: 9pt; }}
+            """
+        )
+
+        self.monitor = CpuMonitor(self)
+        self.monitor.updated.connect(self.update_stats)
+        self.monitor.start()
+
+    def update_stats(self, stats: dict) -> None:
+        self.overall.setText(f"{stats['overall']:.0f}%")
+        self.load_label.setText(f"Load 1m {stats['load1']:.2f}".replace(".", ","))
+        self.active_label.setText(f"Core attivi {stats['active']}/{stats['count']}")
+        freq = stats.get("freq_avg", 0)
+        self.freq_label.setText(
+            f"Media {freq / 1000:.0f} MHz" if freq else "Media —"
+        )
+        for index, row in enumerate(self.bars):
+            row.set_usage(stats["cores"].get(index, 0.0))
 
 
 class TuningRow(QWidget):
@@ -407,6 +605,9 @@ class MainWindow(QWidget):
         for card in (self.stat_temp, self.stat_freq, self.stat_fan, self.stat_batt):
             stats.addWidget(card)
         outer.addLayout(stats)
+
+        self.cpu_panel = CpuPanel(self)
+        outer.addWidget(self.cpu_panel)
 
         self.tuning_panel = SeraTuning(self)
         self.tuning_panel.changed.connect(self.controller.on_tuning_changed)

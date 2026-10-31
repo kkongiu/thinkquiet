@@ -41,6 +41,8 @@ segnalazione di compatibilità se ne provi uno.
     (default 68 °C), poi rampa silenziosa del watchdog.
 - **Fine tuning**: cinque slider per Sera (limiti CPU, ventola base, soglie
   termiche), applicati entro pochi secondi.
+- **Pannello CPU live**: utilizzo per core, carico, core attivi e frequenza
+  media.
 - **Watchdog termico**: la ventola sale automaticamente se la CPU si scalda,
   anche a GUI chiusa.
 - **Sicuro in caso di crash**: `ExecStopPost` rimette la ventola in `auto` se il

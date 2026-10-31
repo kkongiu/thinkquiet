@@ -10,6 +10,8 @@ Initial public release.
 - Thermal watchdog with hysteresis and EC auto fallback.
 - `ExecStopPost` safety: the fan returns to `auto` on crash/stop.
 - Fine-tuning sliders for Sera (CPU caps, fan base, temperature thresholds).
+- Live CPU panel: per-core usage, load average, active cores and average
+  frequency.
 - Persistent last profile and tuning.
 - PySide6 tray application with single-instance IPC.
 - CLI (`status`, `apply`, `stop`, `doctor`, `fan-auto`).
